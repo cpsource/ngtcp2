@@ -507,54 +507,21 @@ static void server_cleanup(Server *s)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Per-connection child process                                       */
+/*  Session loop (runs in forked child)                                */
 /* ------------------------------------------------------------------ */
 
-static void handle_connection(int listen_fd, struct sockaddr_in *bind_addr,
-                              const uint8_t *initial_pkt, size_t pktlen,
-                              struct sockaddr *client_addr,
-                              socklen_t client_addrlen)
+static void session_loop(Server *srv, int fd)
 {
-    Server srv;
-    int cfd, opt = 1;
-
-    /* Create a connected UDP socket for this client.
-     * Because it's connect()ed, the kernel routes matching packets here
-     * instead of to the parent's unconnected listen socket. */
-    cfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (cfd < 0) { perror("[qshd] child socket"); _exit(1); }
-
-    setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    if (bind(cfd, (struct sockaddr *)bind_addr, sizeof(*bind_addr)) < 0) {
-        perror("[qshd] child bind"); _exit(1);
-    }
-    if (connect(cfd, client_addr, client_addrlen) < 0) {
-        perror("[qshd] child connect"); _exit(1);
-    }
-
-    /* Done with the parent's listen socket */
-    close(listen_fd);
-
-    if (server_setup(&srv, cfd, bind_addr, initial_pkt, pktlen,
-                     client_addr, client_addrlen) != 0) {
-        fprintf(stderr, "[qshd:%d] setup failed\n", getpid());
-        close(cfd);
-        _exit(1);
-    }
-    send_packets(&srv);
-
-    /* ---- Session loop ---- */
     while (running) {
         struct pollfd pfds[2];
         int nfds = 1;
 
-        pfds[0].fd     = cfd;
+        pfds[0].fd     = fd;
         pfds[0].events = POLLIN;
 
-        if (srv.shell_running && srv.pty_master >= 0 &&
-            srv.out_sent >= srv.out_len) {
-            pfds[1].fd     = srv.pty_master;
+        if (srv->shell_running && srv->pty_master >= 0 &&
+            srv->out_sent >= srv->out_len) {
+            pfds[1].fd     = srv->pty_master;
             pfds[1].events = POLLIN;
             nfds = 2;
         }
@@ -566,58 +533,79 @@ static void handle_connection(int listen_fd, struct sockaddr_in *bind_addr,
 
         /* PTY output */
         if (nfds > 1 && (pfds[1].revents & (POLLIN | POLLHUP))) {
-            ssize_t n = read(srv.pty_master, srv.out_buf, sizeof(srv.out_buf));
+            ssize_t n = read(srv->pty_master, srv->out_buf,
+                             sizeof(srv->out_buf));
             if (n > 0) {
-                srv.out_len  = (size_t)n;
-                srv.out_sent = 0;
+                srv->out_len  = (size_t)n;
+                srv->out_sent = 0;
             }
             else if (n == 0 ||
                      (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
                 fprintf(stderr, "[qshd:%d] shell exited\n", getpid());
-                srv.out_fin       = 1;
-                srv.shell_running = 0;
-                close(srv.pty_master);
-                srv.pty_master = -1;
-                waitpid(srv.child_pid, NULL, WNOHANG);
-                srv.child_pid = -1;
+                srv->out_fin       = 1;
+                srv->shell_running = 0;
+                close(srv->pty_master);
+                srv->pty_master = -1;
+                waitpid(srv->child_pid, NULL, WNOHANG);
+                srv->child_pid = -1;
             }
         }
 
         /* UDP */
         if (pfds[0].revents & (POLLIN | POLLERR)) {
-            if (recv_packets(&srv) != 0) {
+            if (recv_packets(srv) != 0) {
                 fprintf(stderr, "[qshd:%d] connection error\n", getpid());
                 break;
             }
         }
 
-        send_packets(&srv);
-        ngtcp2_conn_handle_expiry(srv.conn, get_timestamp());
+        send_packets(srv);
+        ngtcp2_conn_handle_expiry(srv->conn, get_timestamp());
 
-        if (ngtcp2_conn_in_draining_period(srv.conn) ||
-            ngtcp2_conn_in_closing_period(srv.conn)) {
+        if (ngtcp2_conn_in_draining_period(srv->conn) ||
+            ngtcp2_conn_in_closing_period(srv->conn)) {
             fprintf(stderr, "[qshd:%d] connection closed\n", getpid());
             break;
         }
 
         /* Exit after FIN sent and no shell — session is done */
-        if (srv.fin_sent && !srv.shell_running)
+        if (srv->fin_sent && !srv->shell_running)
             break;
     }
-
-    server_cleanup(&srv);
-    close(cfd);
-    _exit(0);
 }
 
 /* ------------------------------------------------------------------ */
-/*  Main — accept loop (parent)                                        */
+/*  Handshake (runs in parent, before fork)                            */
+/* ------------------------------------------------------------------ */
+
+static int do_handshake(Server *srv)
+{
+    struct pollfd pfd = { .fd = srv->fd, .events = POLLIN };
+    int loops;
+
+    for (loops = 0; loops < 100; loops++) {
+        if (poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+            if (recv_packets(srv) != 0)
+                return -1;
+        }
+        send_packets(srv);
+        ngtcp2_conn_handle_expiry(srv->conn, get_timestamp());
+
+        if (srv->handshake_done)
+            return 0;
+    }
+
+    fprintf(stderr, "[qshd] handshake timeout\n");
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main — accept, handshake, then fork                                */
 /* ------------------------------------------------------------------ */
 
 static void sigchld_handler(int sig)
 {
     (void)sig;
-    /* Reap all finished children */
     while (waitpid(-1, NULL, WNOHANG) > 0)
         ;
 }
@@ -631,6 +619,7 @@ int main(int argc, char *argv[])
     ssize_t nread;
     struct sockaddr_storage client_addr;
     socklen_t client_addrlen;
+    Server srv;
     pid_t pid;
 
     if (argc > 1) port = atoi(argv[1]);
@@ -672,21 +661,66 @@ int main(int argc, char *argv[])
                          (struct sockaddr *)&client_addr, &client_addrlen);
         if (nread <= 0) continue;
 
-        fprintf(stderr, "[qshd] new connection, forking\n");
+        /* Only process valid QUIC Initial packets */
+        {
+            ngtcp2_pkt_hd hd;
+            if (ngtcp2_accept(&hd, buf, (size_t)nread) != 0)
+                continue;
+        }
 
+        /* Set up connection and complete handshake in the parent */
+        if (server_setup(&srv, fd, &bind_addr, buf, (size_t)nread,
+                         (struct sockaddr *)&client_addr,
+                         client_addrlen) != 0) {
+            fprintf(stderr, "[qshd] setup failed\n");
+            continue;
+        }
+        send_packets(&srv);
+
+        if (do_handshake(&srv) != 0) {
+            server_cleanup(&srv);
+            continue;
+        }
+
+        fprintf(stderr, "[qshd] authenticated %s, forking\n",
+                srv.cert_user[0] ? srv.cert_user : "unknown");
+
+        /* Handshake done — now fork for the session */
         pid = fork();
         if (pid < 0) {
             perror("[qshd] fork");
+            server_cleanup(&srv);
             continue;
         }
         if (pid == 0) {
-            /* Child — handle this connection */
-            handle_connection(fd, &bind_addr, buf, (size_t)nread,
-                              (struct sockaddr *)&client_addr, client_addrlen);
-            /* handle_connection calls _exit, but just in case: */
+            /* Child — connect socket to client, run session */
+            if (connect(fd, (struct sockaddr *)&client_addr,
+                        client_addrlen) < 0) {
+                perror("[qshd] child connect");
+                _exit(1);
+            }
+            session_loop(&srv, fd);
+            server_cleanup(&srv);
+            close(fd);
             _exit(0);
         }
-        /* Parent — continue accepting */
+
+        /* Parent — release connection state (child owns it now),
+         * create a fresh listen socket */
+        ngtcp2_conn_del(srv.conn);
+        wolfSSL_free(srv.ssl);
+        wolfSSL_CTX_free(srv.ssl_ctx);
+        srv.conn = NULL;
+        srv.ssl = NULL;
+        srv.ssl_ctx = NULL;
+
+        close(fd);
+        fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) { perror("[qshd] re-socket"); break; }
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+            perror("[qshd] re-bind"); break;
+        }
     }
 
     close(fd);
