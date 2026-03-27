@@ -78,6 +78,12 @@ openssl req -newkey ec -pkeyopt ec_paramgen_curve:$CURVE \
     -subj "/CN=$USERNAME" \
     2>/dev/null
 
+# Client cert needs extensions to be X.509v3 (wolfSSL requires v3 for peer certs)
+cat > "$DIR/client-ext.cnf" <<EOF
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature
+EOF
+
 openssl x509 -req \
     -in "$DIR/client.csr" \
     -CA "$DIR/ca-cert.pem" \
@@ -85,6 +91,7 @@ openssl x509 -req \
     -CAcreateserial \
     -out "$DIR/client-cert.pem" \
     -days $DAYS \
+    -extfile "$DIR/client-ext.cnf" \
     2>/dev/null
 
 # ---- Cleanup ----

@@ -432,7 +432,7 @@ static int server_setup(Server *s, int fd, struct sockaddr_in *bind_addr,
     s->ssl = wolfSSL_new(s->ssl_ctx);
     if (!s->ssl) return -1;
 
-    wolfSSL_set_verify(s->ssl, SSL_VERIFY_NONE, NULL);
+    wolfSSL_set_verify(s->ssl, SSL_VERIFY_PEER, NULL);
     wolfSSL_set_accept_state(s->ssl);
     wolfSSL_set_alpn_protos(s->ssl, alpn, sizeof(alpn));
 
@@ -507,8 +507,120 @@ static void server_cleanup(Server *s)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Main                                                               */
+/*  Per-connection child process                                       */
 /* ------------------------------------------------------------------ */
+
+static void handle_connection(int listen_fd, struct sockaddr_in *bind_addr,
+                              const uint8_t *initial_pkt, size_t pktlen,
+                              struct sockaddr *client_addr,
+                              socklen_t client_addrlen)
+{
+    Server srv;
+    int cfd, opt = 1;
+
+    /* Create a connected UDP socket for this client.
+     * Because it's connect()ed, the kernel routes matching packets here
+     * instead of to the parent's unconnected listen socket. */
+    cfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (cfd < 0) { perror("[qshd] child socket"); _exit(1); }
+
+    setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    if (bind(cfd, (struct sockaddr *)bind_addr, sizeof(*bind_addr)) < 0) {
+        perror("[qshd] child bind"); _exit(1);
+    }
+    if (connect(cfd, client_addr, client_addrlen) < 0) {
+        perror("[qshd] child connect"); _exit(1);
+    }
+
+    /* Done with the parent's listen socket */
+    close(listen_fd);
+
+    if (server_setup(&srv, cfd, bind_addr, initial_pkt, pktlen,
+                     client_addr, client_addrlen) != 0) {
+        fprintf(stderr, "[qshd:%d] setup failed\n", getpid());
+        close(cfd);
+        _exit(1);
+    }
+    send_packets(&srv);
+
+    /* ---- Session loop ---- */
+    while (running) {
+        struct pollfd pfds[2];
+        int nfds = 1;
+
+        pfds[0].fd     = cfd;
+        pfds[0].events = POLLIN;
+
+        if (srv.shell_running && srv.pty_master >= 0 &&
+            srv.out_sent >= srv.out_len) {
+            pfds[1].fd     = srv.pty_master;
+            pfds[1].events = POLLIN;
+            nfds = 2;
+        }
+
+        if (poll(pfds, (nfds_t)nfds, 50) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        /* PTY output */
+        if (nfds > 1 && (pfds[1].revents & (POLLIN | POLLHUP))) {
+            ssize_t n = read(srv.pty_master, srv.out_buf, sizeof(srv.out_buf));
+            if (n > 0) {
+                srv.out_len  = (size_t)n;
+                srv.out_sent = 0;
+            }
+            else if (n == 0 ||
+                     (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                fprintf(stderr, "[qshd:%d] shell exited\n", getpid());
+                srv.out_fin       = 1;
+                srv.shell_running = 0;
+                close(srv.pty_master);
+                srv.pty_master = -1;
+                waitpid(srv.child_pid, NULL, WNOHANG);
+                srv.child_pid = -1;
+            }
+        }
+
+        /* UDP */
+        if (pfds[0].revents & (POLLIN | POLLERR)) {
+            if (recv_packets(&srv) != 0) {
+                fprintf(stderr, "[qshd:%d] connection error\n", getpid());
+                break;
+            }
+        }
+
+        send_packets(&srv);
+        ngtcp2_conn_handle_expiry(srv.conn, get_timestamp());
+
+        if (ngtcp2_conn_in_draining_period(srv.conn) ||
+            ngtcp2_conn_in_closing_period(srv.conn)) {
+            fprintf(stderr, "[qshd:%d] connection closed\n", getpid());
+            break;
+        }
+
+        /* Exit after FIN sent and no shell — session is done */
+        if (srv.fin_sent && !srv.shell_running)
+            break;
+    }
+
+    server_cleanup(&srv);
+    close(cfd);
+    _exit(0);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main — accept loop (parent)                                        */
+/* ------------------------------------------------------------------ */
+
+static void sigchld_handler(int sig)
+{
+    (void)sig;
+    /* Reap all finished children */
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+        ;
+}
 
 int main(int argc, char *argv[])
 {
@@ -519,13 +631,13 @@ int main(int argc, char *argv[])
     ssize_t nread;
     struct sockaddr_storage client_addr;
     socklen_t client_addrlen;
-    Server srv;
-    int have_conn = 0;
+    pid_t pid;
 
     if (argc > 1) port = atoi(argv[1]);
 
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
+    signal(SIGCHLD, sigchld_handler);
 
     init_cert_paths();
     wolfSSL_Init();
@@ -547,92 +659,38 @@ int main(int argc, char *argv[])
     fprintf(stderr, "[qshd] listening on UDP port %d\n", port);
 
     while (running) {
-        struct pollfd pfds[2];
-        int nfds = 1;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
 
-        pfds[0].fd     = fd;
-        pfds[0].events = POLLIN;
-
-        /* Also poll PTY when output buffer has been drained */
-        if (have_conn && srv.shell_running && srv.pty_master >= 0 &&
-            srv.out_sent >= srv.out_len) {
-            pfds[1].fd     = srv.pty_master;
-            pfds[1].events = POLLIN;
-            nfds = 2;
-        }
-
-        if (poll(pfds, (nfds_t)nfds, 50) < 0) {
+        if (poll(&pfd, 1, 200) < 0) {
             if (errno == EINTR) continue;
             break;
         }
+        if (!(pfd.revents & POLLIN)) continue;
 
-        /* ---- Read PTY output ---- */
-        if (nfds > 1 && (pfds[1].revents & (POLLIN | POLLHUP))) {
-            ssize_t n = read(srv.pty_master, srv.out_buf, sizeof(srv.out_buf));
-            if (n > 0) {
-                srv.out_len  = (size_t)n;
-                srv.out_sent = 0;
-            }
-            else if (n == 0 ||
-                     (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                /* PTY closed — shell exited */
-                fprintf(stderr, "[qshd] shell exited\n");
-                srv.out_fin      = 1;
-                srv.shell_running = 0;
-                close(srv.pty_master);
-                srv.pty_master = -1;
-                waitpid(srv.child_pid, NULL, WNOHANG);
-                srv.child_pid = -1;
-            }
+        client_addrlen = sizeof(client_addr);
+        nread = recvfrom(fd, buf, sizeof(buf), 0,
+                         (struct sockaddr *)&client_addr, &client_addrlen);
+        if (nread <= 0) continue;
+
+        fprintf(stderr, "[qshd] new connection, forking\n");
+
+        pid = fork();
+        if (pid < 0) {
+            perror("[qshd] fork");
+            continue;
         }
-
-        /* ---- Handle UDP ---- */
-        if (pfds[0].revents & POLLIN) {
-            if (!have_conn) {
-                client_addrlen = sizeof(client_addr);
-                nread = recvfrom(fd, buf, sizeof(buf), 0,
-                                 (struct sockaddr *)&client_addr,
-                                 &client_addrlen);
-                if (nread <= 0) continue;
-
-                fprintf(stderr, "[qshd] new connection\n");
-
-                if (server_setup(&srv, fd, &bind_addr, buf, (size_t)nread,
-                                 (struct sockaddr *)&client_addr,
-                                 client_addrlen) != 0) {
-                    fprintf(stderr, "[qshd] setup failed\n");
-                    continue;
-                }
-                have_conn = 1;
-                send_packets(&srv);
-            }
-            else {
-                if (recv_packets(&srv) != 0) {
-                    fprintf(stderr, "[qshd] connection error, resetting\n");
-                    server_cleanup(&srv);
-                    have_conn = 0;
-                    continue;
-                }
-            }
+        if (pid == 0) {
+            /* Child — handle this connection */
+            handle_connection(fd, &bind_addr, buf, (size_t)nread,
+                              (struct sockaddr *)&client_addr, client_addrlen);
+            /* handle_connection calls _exit, but just in case: */
+            _exit(0);
         }
-
-        if (have_conn) {
-            send_packets(&srv);
-            ngtcp2_conn_handle_expiry(srv.conn, get_timestamp());
-
-            if (ngtcp2_conn_in_draining_period(srv.conn) ||
-                ngtcp2_conn_in_closing_period(srv.conn)) {
-                fprintf(stderr, "[qshd] connection closed\n");
-                server_cleanup(&srv);
-                have_conn = 0;
-            }
-        }
+        /* Parent — continue accepting */
     }
 
-    if (have_conn) server_cleanup(&srv);
     close(fd);
     wolfSSL_Cleanup();
-
     fprintf(stderr, "[qshd] shutdown\n");
     return 0;
 }
