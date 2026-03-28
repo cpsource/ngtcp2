@@ -420,6 +420,7 @@ static int client_init(Client *c, const char *host, int port)
     params.initial_max_stream_data_bidi_local  = 256 * 1024;
     params.initial_max_stream_data_bidi_remote = 256 * 1024;
     params.initial_max_data                    = 1024 * 1024;
+    params.max_idle_timeout                    = 30 * NGTCP2_SECONDS;
 
     dcid.datalen = NGTCP2_MIN_INITIAL_DCIDLEN;
     rand_cb(dcid.data, dcid.datalen, NULL);
@@ -437,6 +438,11 @@ static int client_init(Client *c, const char *host, int port)
     if (rv != 0) return -1;
 
     ngtcp2_conn_set_tls_native_handle(c->conn, c->ssl);
+
+    /* Send PING frames every 15s to keep connection alive across NATs
+     * and detect dead connections before the 30s idle timeout */
+    ngtcp2_conn_set_keep_alive_timeout(c->conn, 15 * NGTCP2_SECONDS);
+
     return 0;
 }
 
@@ -540,15 +546,70 @@ static void parse_host(const char *arg, char *user, size_t usersz,
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
 
+static void client_cleanup(Client *c)
+{
+    if (c->conn) ngtcp2_conn_del(c->conn);
+    if (c->ssl)  wolfSSL_free(c->ssl);
+    if (c->ssl_ctx) wolfSSL_CTX_free(c->ssl_ctx);
+    if (c->fd >= 0) close(c->fd);
+    c->conn = NULL;
+    c->ssl = NULL;
+    c->ssl_ctx = NULL;
+    c->fd = -1;
+}
+
+static int conn_is_dead(Client *c)
+{
+    return ngtcp2_conn_in_draining_period(c->conn) ||
+           ngtcp2_conn_in_closing_period(c->conn);
+}
+
+/* Connect, open data stream, return 0 on success */
+static int do_connect(Client *client, const char *host, int port,
+                      uint16_t rows, uint16_t cols)
+{
+    int64_t sid;
+    uint8_t hdr[5];
+
+    if (client_init(client, host, port) != 0) {
+        fprintf(stderr, "qsh: connection init failed\n");
+        return -1;
+    }
+    if (do_handshake(client) != 0) {
+        fprintf(stderr, "qsh: handshake failed\n");
+        client_cleanup(client);
+        return -1;
+    }
+
+    if (ngtcp2_conn_open_bidi_stream(client->conn, &sid, NULL) != 0) {
+        fprintf(stderr, "qsh: cannot open stream\n");
+        client_cleanup(client);
+        return -1;
+    }
+    client->data_stream_id = sid;
+
+    hdr[0] = STREAM_TYPE_DATA;
+    hdr[1] = (rows >> 8) & 0xff;
+    hdr[2] =  rows       & 0xff;
+    hdr[3] = (cols >> 8) & 0xff;
+    hdr[4] =  cols       & 0xff;
+
+    memcpy(client->out_buf, hdr, 5);
+    client->out_len  = 5;
+    client->out_sent = 0;
+    send_packets(client);
+
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     char user[64] = {0}, host[256] = {0};
     int port = DEFAULT_PORT;
     int i, got_host = 0;
     Client client;
-    int64_t sid;
     uint16_t rows, cols;
-    uint8_t hdr[5];
+    int retries;
 
     /* Set defaults before parsing args */
     init_cert_paths();
@@ -591,115 +652,127 @@ int main(int argc, char *argv[])
     if (!user[0])
         get_cert_user(CLIENT_CERT, user, sizeof(user));
     if (!user[0])
-        snprintf(user, sizeof(user), "%s", getenv("USER") ? getenv("USER") : "unknown");
-
-    fprintf(stderr, "qsh: connecting to %s@%s:%d via QUIC...\n",
-            user, host, port);
-
-    if (client_init(&client, host, port) != 0) {
-        fprintf(stderr, "qsh: connection init failed\n");
-        return 1;
-    }
-    if (do_handshake(&client) != 0) {
-        fprintf(stderr, "qsh: handshake failed\n");
-        return 1;
-    }
-
-    fprintf(stderr, "qsh: connected (TLS 1.3 / QUIC)\n");
-
-    /* Open the data stream and send the header */
-    if (ngtcp2_conn_open_bidi_stream(client.conn, &sid, NULL) != 0) {
-        fprintf(stderr, "qsh: cannot open stream\n");
-        return 1;
-    }
-    client.data_stream_id = sid;
-
-    get_winsize(&rows, &cols);
-    hdr[0] = STREAM_TYPE_DATA;
-    hdr[1] = (rows >> 8) & 0xff;
-    hdr[2] =  rows       & 0xff;
-    hdr[3] = (cols >> 8) & 0xff;
-    hdr[4] =  cols       & 0xff;
-
-    memcpy(client.out_buf, hdr, 5);
-    client.out_len  = 5;
-    client.out_sent = 0;
-    send_packets(&client);
-
-    /* Switch terminal to raw mode */
-    set_raw_mode();
-    atexit(restore_terminal);
+        snprintf(user, sizeof(user), "%s",
+                 getenv("USER") ? getenv("USER") : "unknown");
 
     signal(SIGWINCH, sigwinch_handler);
     signal(SIGINT,   sig_handler);
     signal(SIGTERM,  sig_handler);
+    atexit(restore_terminal);
 
-    /* ---- Interactive loop ---- */
-    while (running && !client.stream_fin &&
-           !ngtcp2_conn_in_draining_period(client.conn) &&
-           !ngtcp2_conn_in_closing_period(client.conn)) {
-        struct pollfd pfds[2];
-        int nfds = 2;
+    /* ---- Connect / reconnect loop ---- */
+    for (retries = 0; running; retries++) {
+        int session_ok;
 
-        pfds[0].fd     = client.fd;
-        pfds[0].events = POLLIN;
-        pfds[1].fd     = STDIN_FILENO;
-        pfds[1].events = (client.out_sent >= client.out_len) ? POLLIN : 0;
+        if (retries > 0) {
+            restore_terminal();
+            fprintf(stderr, "qsh: reconnecting in 2 seconds...\n");
+            sleep(2);
+            if (!running) break;
+        }
 
-        if (poll(pfds, (nfds_t)nfds, 50) < 0) {
-            if (errno == EINTR) continue;
+        fprintf(stderr, "qsh: connecting to %s@%s:%d via QUIC...\n",
+                user, host, port);
+
+        get_winsize(&rows, &cols);
+        if (do_connect(&client, host, port, rows, cols) != 0) {
+            if (retries >= 5) {
+                fprintf(stderr, "qsh: giving up after %d attempts\n",
+                        retries + 1);
+                break;
+            }
+            continue;
+        }
+
+        fprintf(stderr, "qsh: connected (TLS 1.3 / QUIC)\n");
+        retries = 0;   /* reset on successful connect */
+
+        set_raw_mode();
+
+        /* ---- Interactive session loop ---- */
+        session_ok = 1;
+        while (running && !client.stream_fin && !conn_is_dead(&client)) {
+            struct pollfd pfds[2];
+            int nfds = 2;
+
+            pfds[0].fd     = client.fd;
+            pfds[0].events = POLLIN;
+            pfds[1].fd     = STDIN_FILENO;
+            pfds[1].events = (client.out_sent >= client.out_len) ? POLLIN : 0;
+
+            if (poll(pfds, (nfds_t)nfds, 50) < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+
+            /* stdin → QUIC */
+            if ((pfds[1].revents & POLLIN) &&
+                client.out_sent >= client.out_len) {
+                ssize_t n = read(STDIN_FILENO, client.out_buf,
+                                 sizeof(client.out_buf));
+                if (n > 0) {
+                    client.out_len  = (size_t)n;
+                    client.out_sent = 0;
+                }
+                else if (n == 0) {
+                    session_ok = 0;
+                    break;   /* EOF on stdin — no reconnect */
+                }
+            }
+
+            /* QUIC → stdout */
+            if (pfds[0].revents & POLLIN) {
+                if (recv_packets(&client) != 0)
+                    break;
+            }
+
+            /* Window resize */
+            if (got_winch) {
+                got_winch = 0;
+                get_winsize(&rows, &cols);
+                send_resize(&client, rows, cols);
+            }
+
+            send_packets(&client);
+            ngtcp2_conn_handle_expiry(client.conn, get_timestamp());
+        }
+
+        restore_terminal();
+
+        /* Report reason for disconnect */
+        if (client.stream_fin) {
+            fprintf(stderr, "qsh: shell exited\n");
+            client_cleanup(&client);
+            break;   /* Normal exit — don't reconnect */
+        }
+
+        if (conn_is_dead(&client)) {
+            const ngtcp2_ccerr *ccerr = ngtcp2_conn_get_ccerr(client.conn);
+            if (ccerr->reasonlen > 0) {
+                fprintf(stderr, "\r\nqsh: server closed connection: %.*s\r\n",
+                        (int)ccerr->reasonlen, ccerr->reason);
+                client_cleanup(&client);
+                break;   /* Server rejected us — don't reconnect */
+            }
+            fprintf(stderr, "qsh: connection lost\n");
+        }
+        else if (!running) {
+            client_cleanup(&client);
             break;
         }
-
-        /* stdin → QUIC */
-        if ((pfds[1].revents & POLLIN) && client.out_sent >= client.out_len) {
-            ssize_t n = read(STDIN_FILENO, client.out_buf,
-                             sizeof(client.out_buf));
-            if (n > 0) {
-                client.out_len  = (size_t)n;
-                client.out_sent = 0;
-            }
-            else if (n == 0) {
-                break;   /* EOF on stdin */
-            }
+        else if (!session_ok) {
+            client_cleanup(&client);
+            break;   /* stdin EOF — no reconnect */
+        }
+        else {
+            fprintf(stderr, "qsh: connection lost\n");
         }
 
-        /* QUIC → stdout */
-        if (pfds[0].revents & POLLIN) {
-            if (recv_packets(&client) != 0)
-                break;
-        }
-
-        /* Window resize */
-        if (got_winch) {
-            got_winch = 0;
-            get_winsize(&rows, &cols);
-            send_resize(&client, rows, cols);
-        }
-
-        send_packets(&client);
-        ngtcp2_conn_handle_expiry(client.conn, get_timestamp());
+        client_cleanup(&client);
+        /* Loop back to reconnect */
     }
 
-    /* Report reason if server closed the connection */
-    if (ngtcp2_conn_in_draining_period(client.conn) ||
-        ngtcp2_conn_in_closing_period(client.conn)) {
-        const ngtcp2_ccerr *ccerr = ngtcp2_conn_get_ccerr(client.conn);
-        if (ccerr->reasonlen > 0)
-            fprintf(stderr, "\r\nqsh: server closed connection: %.*s\r\n",
-                    (int)ccerr->reasonlen, ccerr->reason);
-        else
-            fprintf(stderr, "\r\nqsh: server closed connection\r\n");
-    }
-
-    /* Cleanup */
-    restore_terminal();
-    ngtcp2_conn_del(client.conn);
-    wolfSSL_free(client.ssl);
-    wolfSSL_CTX_free(client.ssl_ctx);
-    close(client.fd);
     wolfSSL_Cleanup();
-
     fprintf(stderr, "qsh: disconnected\n");
     return 0;
 }

@@ -517,6 +517,7 @@ static int server_setup(Server *s, int fd, struct sockaddr_in *bind_addr,
     params.initial_max_stream_data_bidi_local  = 256 * 1024;
     params.initial_max_stream_data_bidi_remote = 256 * 1024;
     params.initial_max_data                    = 1024 * 1024;
+    params.max_idle_timeout                    = 30 * NGTCP2_SECONDS;
     params.original_dcid         = hd.dcid;
     params.original_dcid_present = 1;
 
