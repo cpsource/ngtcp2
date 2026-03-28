@@ -610,7 +610,9 @@ int main(int argc, char *argv[])
     signal(SIGTERM,  sig_handler);
 
     /* ---- Interactive loop ---- */
-    while (running && !client.stream_fin) {
+    while (running && !client.stream_fin &&
+           !ngtcp2_conn_in_draining_period(client.conn) &&
+           !ngtcp2_conn_in_closing_period(client.conn)) {
         struct pollfd pfds[2];
         int nfds = 2;
 
@@ -638,8 +640,10 @@ int main(int argc, char *argv[])
         }
 
         /* QUIC → stdout */
-        if (pfds[0].revents & POLLIN)
-            recv_packets(&client);
+        if (pfds[0].revents & POLLIN) {
+            if (recv_packets(&client) != 0)
+                break;
+        }
 
         /* Window resize */
         if (got_winch) {
@@ -650,6 +654,17 @@ int main(int argc, char *argv[])
 
         send_packets(&client);
         ngtcp2_conn_handle_expiry(client.conn, get_timestamp());
+    }
+
+    /* Report reason if server closed the connection */
+    if (ngtcp2_conn_in_draining_period(client.conn) ||
+        ngtcp2_conn_in_closing_period(client.conn)) {
+        const ngtcp2_ccerr *ccerr = ngtcp2_conn_get_ccerr(client.conn);
+        if (ccerr->reasonlen > 0)
+            fprintf(stderr, "\r\nqsh: server closed connection: %.*s\r\n",
+                    (int)ccerr->reasonlen, ccerr->reason);
+        else
+            fprintf(stderr, "\r\nqsh: server closed connection\r\n");
     }
 
     /* Cleanup */

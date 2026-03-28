@@ -48,6 +48,7 @@
 static char cert_file[512];
 static char key_file[512];
 static char ca_file[512];
+static char crl_dir[512];
 
 static void init_cert_paths(void)
 {
@@ -56,6 +57,7 @@ static void init_cert_paths(void)
     snprintf(cert_file, sizeof(cert_file), "%s/ssh/certs/server-cert.pem", home);
     snprintf(key_file,  sizeof(key_file),  "%s/ssh/certs/server-key.pem", home);
     snprintf(ca_file,   sizeof(ca_file),   "%s/ssh/certs/ca-cert.pem", home);
+    snprintf(crl_dir,   sizeof(crl_dir),   "%s/ssh/crl", home);
 }
 
 #define CERT_FILE  cert_file
@@ -116,7 +118,8 @@ typedef struct {
     struct sockaddr_storage remote_addr;
     socklen_t              remote_addrlen;
     int                    handshake_done;
-    char                   cert_user[64]; /* CN from client cert */
+    char                   cert_user[64];  /* CN from client cert */
+    int                    cert_revoked;
 
     /* PTY state */
     int       pty_master;
@@ -268,16 +271,38 @@ static int handshake_completed_cb(ngtcp2_conn *conn, void *user_data)
     (void)conn;
     s->handshake_done = 1;
 
-    /* Extract username from client certificate CN */
+    /* Extract username and check revocation from client certificate */
     {
         WOLFSSL_X509 *peer = wolfSSL_get_peer_certificate(s->ssl);
         if (peer) {
             char *cn = wolfSSL_X509_get_subjectCN(peer);
-            if (cn && cn[0]) {
+            if (cn && cn[0])
                 snprintf(s->cert_user, sizeof(s->cert_user), "%s", cn);
+
+            /* Check CRL: serial number as hex filename in crl_dir */
+            {
+                byte serial[32];
+                int serialSz = (int)sizeof(serial);
+                char hex[65], path[600];
+                int i;
+
+                if (wolfSSL_X509_get_serial_number(peer, serial,
+                                                   &serialSz) == WOLFSSL_SUCCESS) {
+                    for (i = 0; i < serialSz; i++)
+                        snprintf(hex + i * 2, 3, "%02X", serial[i]);
+                    snprintf(path, sizeof(path), "%s/%s", crl_dir, hex);
+                    if (access(path, F_OK) == 0) {
+                        s->cert_revoked = 1;
+                        fprintf(stderr,
+                            "[qshd] REVOKED cert serial %s (user: %s)\n",
+                            hex, s->cert_user);
+                    }
+                }
             }
-            fprintf(stderr, "[qshd] handshake complete (user: %s)\n",
-                    s->cert_user[0] ? s->cert_user : "unknown");
+
+            if (!s->cert_revoked)
+                fprintf(stderr, "[qshd] handshake complete (user: %s)\n",
+                        s->cert_user[0] ? s->cert_user : "unknown");
             wolfSSL_X509_free(peer);
         }
         else {
@@ -678,6 +703,35 @@ int main(int argc, char *argv[])
         send_packets(&srv);
 
         if (do_handshake(&srv) != 0) {
+            server_cleanup(&srv);
+            continue;
+        }
+
+        if (srv.cert_revoked) {
+            fprintf(stderr, "[qshd] rejected revoked user %s\n",
+                    srv.cert_user);
+            /* Send CONNECTION_CLOSE so the client stops immediately */
+            {
+                uint8_t closebuf[1400];
+                ngtcp2_path_storage ps;
+                ngtcp2_pkt_info pi;
+                ngtcp2_ccerr ccerr;
+                ngtcp2_ssize n;
+
+                ngtcp2_path_storage_zero(&ps);
+                ngtcp2_ccerr_set_application_error(
+                    &ccerr, 1,
+                    (const uint8_t *)"certificate revoked", 19);
+
+                n = ngtcp2_conn_write_connection_close(
+                    srv.conn, &ps.path, &pi,
+                    closebuf, sizeof(closebuf),
+                    &ccerr, get_timestamp());
+                if (n > 0)
+                    sendto(srv.fd, closebuf, (size_t)n, 0,
+                           (struct sockaddr *)&srv.remote_addr,
+                           srv.remote_addrlen);
+            }
             server_cleanup(&srv);
             continue;
         }
