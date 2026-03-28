@@ -500,12 +500,19 @@ static void get_cert_user(const char *cert_path, char *user, size_t usersz)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s --host=<hostname> [--port=N]\n"
-        "       %s --host=<user>:<hostname> [--port=N]\n"
+        "Usage: %s --host=<hostname> [options]\n"
         "\n"
-        "  Username is read from the client certificate CN.\n"
-        "  The user:host form overrides the cert CN.\n",
-        prog, prog);
+        "Options:\n"
+        "  --host=<hostname>        Server to connect to\n"
+        "  --host=<user>:<hostname> Override username from cert CN\n"
+        "  --port=N                 UDP port (default: 2222)\n"
+        "  --user=<name>            Use ~/ssh/certs/<name>-{cert,key}.pem\n"
+        "  --cert=<path>            Client certificate file\n"
+        "  --key=<path>             Client private key file\n"
+        "  --ca=<path>              CA certificate file\n"
+        "\n"
+        "Defaults: ~/ssh/certs/{client-cert,client-key,ca-cert}.pem\n",
+        prog);
     exit(1);
 }
 
@@ -543,6 +550,9 @@ int main(int argc, char *argv[])
     uint16_t rows, cols;
     uint8_t hdr[5];
 
+    /* Set defaults before parsing args */
+    init_cert_paths();
+
     for (i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--host=", 7) == 0) {
             parse_host(argv[i] + 7, user, sizeof(user),
@@ -552,14 +562,29 @@ int main(int argc, char *argv[])
         else if (strncmp(argv[i], "--port=", 7) == 0) {
             port = atoi(argv[i] + 7);
         }
+        else if (strncmp(argv[i], "--user=", 7) == 0) {
+            const char *home = getenv("HOME");
+            if (!home) home = ".";
+            snprintf(client_cert, sizeof(client_cert),
+                     "%s/ssh/certs/%s-cert.pem", home, argv[i] + 7);
+            snprintf(client_key, sizeof(client_key),
+                     "%s/ssh/certs/%s-key.pem", home, argv[i] + 7);
+        }
+        else if (strncmp(argv[i], "--cert=", 7) == 0) {
+            snprintf(client_cert, sizeof(client_cert), "%s", argv[i] + 7);
+        }
+        else if (strncmp(argv[i], "--key=", 6) == 0) {
+            snprintf(client_key, sizeof(client_key), "%s", argv[i] + 6);
+        }
+        else if (strncmp(argv[i], "--ca=", 5) == 0) {
+            snprintf(ca_file, sizeof(ca_file), "%s", argv[i] + 5);
+        }
         else {
             usage(argv[0]);
         }
     }
 
     if (!got_host) usage(argv[0]);
-
-    init_cert_paths();
     wolfSSL_Init();
 
     /* If no user given on command line, read it from the cert CN */

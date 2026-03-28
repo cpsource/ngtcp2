@@ -66,30 +66,69 @@ This creates:
 Client certificates must be X.509v3 (with extensions). wolfSSL rejects
 v1 certificates for peer verification.
 
-### Adding Another User
+### Adding Users
 
-The secure way -- user generates their own key:
+The quick way -- use the `add-user.sh` script:
+
+```bash
+# Add alice (identity only -- HOME defaults to /home/alice)
+./tools/add-user.sh alice
+
+# Add alice with access to the ubuntu account (/home/ubuntu)
+./tools/add-user.sh alice ubuntu
+
+# Add bob with access to the ubuntu account
+./tools/add-user.sh bob ubuntu
+```
+
+The certificate CN is the user's identity (shown in logs, set as USER).
+The optional second argument becomes the certificate OU, which tells
+qshd which unix account (HOME directory) to use. If omitted, the CN
+is used for both.
+
+Output files:
+
+- `alice-cert.pem` -- signed client certificate
+- `alice-key.pem` -- client private key
+
+Give the user these three files:
+
+1. `alice-cert.pem` -> install as `~/ssh/certs/client-cert.pem`
+2. `alice-key.pem` -> install as `~/ssh/certs/client-key.pem`
+3. `certs/ca-cert.pem` -> install as `~/ssh/certs/ca-cert.pem`
+
+The script prints the certificate serial number for easy revocation.
+
+### Adding Users (Manual / Secure Way)
+
+If the user should generate their own private key (recommended for
+production), have them create a CSR on their machine:
 
 ```bash
 # On the user's machine:
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
-    -keyout my-key.pem -out my.csr -nodes -subj "/CN=alice"
+    -keyout my-key.pem -out my.csr -nodes -subj "/CN=alice/OU=ubuntu"
 
 # Send my.csr to the admin (NOT the private key)
 ```
 
 ```bash
 # Admin signs it:
-cat > client-ext.cnf <<EOF
-basicConstraints = CA:FALSE
-keyUsage = digitalSignature
-EOF
-
 openssl x509 -req -in my.csr -CA certs/ca-cert.pem -CAkey certs/ca-key.pem \
     -CAcreateserial -out alice-cert.pem -days 365 -extfile client-ext.cnf
 
 # Send alice-cert.pem + certs/ca-cert.pem back to the user
 ```
+
+The `client-ext.cnf` file contains the required X.509v3 extensions:
+
+```
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature
+```
+
+Without these extensions, openssl creates a v1 certificate which
+wolfSSL will reject.
 
 ## Building
 

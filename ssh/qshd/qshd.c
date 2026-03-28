@@ -118,7 +118,8 @@ typedef struct {
     struct sockaddr_storage remote_addr;
     socklen_t              remote_addrlen;
     int                    handshake_done;
-    char                   cert_user[64];  /* CN from client cert */
+    char                   cert_user[64];  /* CN from client cert (identity) */
+    char                   cert_account[64]; /* OU from client cert (unix account) */
     int                    cert_revoked;
 
     /* PTY state */
@@ -165,14 +166,22 @@ static int start_shell(Server *s, uint16_t rows, uint16_t cols)
     }
 
     if (s->child_pid == 0) {
-        /* Child — set up environment from cert identity, exec shell */
+        /* Child — set up environment from cert identity, exec shell.
+         * CN  = user identity (e.g. "alice") → USER, LOGNAME
+         * OU  = target unix account (e.g. "ubuntu") → HOME, chdir
+         * If no OU, the CN is used for both. */
+        const char *identity = s->cert_user;
+        const char *account  = s->cert_account[0] ? s->cert_account
+                                                   : s->cert_user;
+
         setenv("TERM", "xterm-256color", 1);
-        if (s->cert_user[0]) {
-            setenv("USER",    s->cert_user, 1);
-            setenv("LOGNAME", s->cert_user, 1);
-            /* Try to set HOME to the user's home directory */
+        if (identity[0]) {
+            setenv("USER",    identity, 1);
+            setenv("LOGNAME", identity, 1);
+        }
+        if (account[0]) {
             char home[256];
-            snprintf(home, sizeof(home), "/home/%s", s->cert_user);
+            snprintf(home, sizeof(home), "/home/%s", account);
             if (access(home, F_OK) == 0) {
                 setenv("HOME", home, 1);
                 if (chdir(home) != 0)
@@ -279,6 +288,19 @@ static int handshake_completed_cb(ngtcp2_conn *conn, void *user_data)
             if (cn && cn[0])
                 snprintf(s->cert_user, sizeof(s->cert_user), "%s", cn);
 
+            /* Extract OU for target unix account (optional) */
+            {
+                WOLFSSL_X509_NAME *name = wolfSSL_X509_get_subject_name(peer);
+                if (name) {
+                    char ou[64] = {0};
+                    wolfSSL_X509_NAME_get_text_by_NID(name,
+                        NID_organizationalUnitName, ou, sizeof(ou));
+                    if (ou[0])
+                        snprintf(s->cert_account, sizeof(s->cert_account),
+                                 "%s", ou);
+                }
+            }
+
             /* Check CRL: serial number as hex filename in crl_dir */
             {
                 byte serial[32];
@@ -300,9 +322,15 @@ static int handshake_completed_cb(ngtcp2_conn *conn, void *user_data)
                 }
             }
 
-            if (!s->cert_revoked)
-                fprintf(stderr, "[qshd] handshake complete (user: %s)\n",
+            if (!s->cert_revoked) {
+                if (s->cert_account[0])
+                    fprintf(stderr,
+                        "[qshd] handshake complete (user: %s, account: %s)\n",
+                        s->cert_user, s->cert_account);
+                else
+                    fprintf(stderr, "[qshd] handshake complete (user: %s)\n",
                         s->cert_user[0] ? s->cert_user : "unknown");
+            }
             wolfSSL_X509_free(peer);
         }
         else {
