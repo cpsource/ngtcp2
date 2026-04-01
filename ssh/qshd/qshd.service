@@ -1,0 +1,14 @@
+[Unit]
+Description=QUIC Shell Daemon (qshd)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/ubuntu/ngtcp2/ssh/qshd/qshd --user ubuntu 2222
+Restart=on-failure
+RestartSec=5
+Environment=HOME=/home/ubuntu
+WorkingDirectory=/home/ubuntu/ngtcp2/ssh/qshd
+
+[Install]
+WantedBy=multi-user.target

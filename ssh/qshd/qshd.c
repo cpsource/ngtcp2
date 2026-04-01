@@ -29,6 +29,8 @@
 #include <sys/wait.h>
 #include <arpa/inet.h>
 #include <pty.h>
+#include <pwd.h>
+#include <grp.h>
 #include <termios.h>
 
 #include <wolfssl/options.h>
@@ -66,6 +68,7 @@ static void init_cert_paths(void)
 
 static const unsigned char alpn[] = {3, 'q', 's', 'h'};
 static volatile int running = 1;
+static const char *run_user = NULL;  /* --user: drop privileges to this user */
 
 static void sig_handler(int sig) { (void)sig; running = 0; }
 
@@ -188,6 +191,24 @@ static int start_shell(Server *s, uint16_t rows, uint16_t cols)
                     perror("chdir");
             }
         }
+        /* Drop privileges to --user if specified */
+        if (run_user) {
+            struct passwd *pw = getpwnam(run_user);
+            if (!pw) {
+                fprintf(stderr, "[qshd] unknown user: %s\n", run_user);
+                _exit(1);
+            }
+            if (!account[0]) {
+                /* Use run_user's home if cert didn't specify an account */
+                setenv("HOME", pw->pw_dir, 1);
+                if (chdir(pw->pw_dir) != 0)
+                    perror("chdir");
+            }
+            if (initgroups(run_user, pw->pw_gid) != 0) perror("initgroups");
+            if (setgid(pw->pw_gid) != 0) { perror("setgid"); _exit(1); }
+            if (setuid(pw->pw_uid) != 0) { perror("setuid"); _exit(1); }
+        }
+
         execl("/bin/bash", "bash", "--login", (char *)NULL);
         _exit(1);
     }
@@ -676,7 +697,13 @@ int main(int argc, char *argv[])
     Server srv;
     pid_t pid;
 
-    if (argc > 1) port = atoi(argv[1]);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--user") == 0 && i + 1 < argc) {
+            run_user = argv[++i];
+        } else {
+            port = atoi(argv[i]);
+        }
+    }
 
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
